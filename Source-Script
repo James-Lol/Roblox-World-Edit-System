@@ -1,0 +1,708 @@
+--World Edit System Script by James @welfringJames9 (https://www.roblox.com/users/4032069035/profile)
+
+-- Click to select a part. Press R for Move, T for Resize, Z or Y for Rotate, G to delete.
+-- Press B to disable or enable Part manipulation tool!
+
+-- Main Configurations
+local DefaultMode = "Move"
+local ROTATION_GRID = 15  -- Grid increment in degrees
+local GRID_SIZE = 1  -- Size of the grid (in studs)
+local MaxDragHandleAtOnce = 1
+
+--Handle and other configurations
+
+local HANDLE_RADIUS = 0.9
+local INNER_HANDLE_RADIUS = 0.25
+local HANDLE_TRANSPARENCY = 0
+local HANDLE_OFFSET = 1.5
+local RING_THICKNESS = 0.15
+local MAX_SIZE_PER_AXIS = 2048  -- Maximum size per axis in studs for resize mode (Do not change above 2048)
+
+--Script
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+-- Constants
+local HANDLE_COLORS = {
+	[Enum.Axis.X] = Color3.new(0.870588, 0.0980392, 0.12549),
+	[Enum.Axis.Y] = Color3.new(0.0705882, 0.780392, 0.105882),
+	[Enum.Axis.Z] = Color3.new(0.0666667, 0.560784, 0.909804)
+}
+
+local HANDLE_ACTIVE_COLORS = {
+	[Enum.Axis.X] = Color3.new(1, 0.113725, 0.145098),
+	[Enum.Axis.Y] = Color3.new(0.0784314, 0.862745, 0.105882),
+	[Enum.Axis.Z] = Color3.new(0.12549, 0.694118, 1)
+}
+
+local INNER_HANDLE_COLORS = {
+	[Enum.Axis.X] = Color3.new(0.596078, 0.0666667, 0.0862745),
+	[Enum.Axis.Y] = Color3.new(0.054902, 0.619608, 0.0666667),
+	[Enum.Axis.Z] = Color3.new(0.0470588, 0.411765, 0.65098)
+}
+
+local NORMALS_TO_AXIS = {
+	[Enum.NormalId.Left] = Enum.Axis.X,
+	[Enum.NormalId.Right] = Enum.Axis.X,
+	[Enum.NormalId.Top] = Enum.Axis.Y,
+	[Enum.NormalId.Bottom] = Enum.Axis.Y,
+	[Enum.NormalId.Back] = Enum.Axis.Z,
+	[Enum.NormalId.Front] = Enum.Axis.Z
+}
+
+local INVERSE_NORMALS = {
+	[Enum.NormalId.Left] = true,
+	[Enum.NormalId.Bottom] = true,
+	[Enum.NormalId.Back] = true
+}
+
+-- Global variables
+local SelectedPart = nil
+local CurrentMode = DefaultMode
+local Handles = {}
+local IsHoveringHandle = false
+local RotationHandles = {}
+local ActiveHandles = {}
+local BuildingEnabled = true  -- New variable to track building state
+
+-- Helper Functions
+local function ApplySnap(value, isRotation)
+	if isRotation then
+		return math.rad(math.floor(math.deg(value) / ROTATION_GRID) * ROTATION_GRID)
+	else
+		return math.floor(value / GRID_SIZE) * GRID_SIZE
+	end
+end
+
+local function CanActivateHandle()
+	return #ActiveHandles < MaxDragHandleAtOnce
+end
+
+local function GetMousePositionOnAxis(axisVector, partCFrame)
+    local UserInputService = game:GetService("UserInputService")
+    local camera = workspace.CurrentCamera
+    if not camera then return partCFrame.Position end
+
+    -- Get mouse position and ensure axisVector is normalized
+    local mouseLocation = UserInputService:GetMouseLocation()
+    local normalizedAxisVector = axisVector.Unit
+    
+    -- Calculate world-space axis and position
+    local worldAxisVector = partCFrame:VectorToWorldSpace(normalizedAxisVector)
+    local partPosition = partCFrame.Position
+    
+    -- Create and normalize ray from camera through mouse position
+    local rayOrigin = camera.CFrame.Position
+    local rayDirection = camera:ScreenPointToRay(mouseLocation.X, mouseLocation.Y).Direction.Unit
+    
+    -- Calculate camera-aligned plane for intersection
+    local planeNormal = camera.CFrame.LookVector
+    local planeDot = planeNormal:Dot(rayDirection)
+    
+    -- Handle near-parallel cases and invalid conditions
+    local MIN_DOT_THRESHOLD = 1e-4
+    if math.abs(planeDot) < MIN_DOT_THRESHOLD then
+        return partPosition
+    end
+    
+    -- Calculate intersection with camera-aligned plane
+    local vectorToPlane = partPosition - rayOrigin
+    local intersectionDistance = planeNormal:Dot(vectorToPlane) / planeDot
+    
+    -- Validate intersection distance
+    if intersectionDistance < 0 then
+        return partPosition
+    end
+    
+    -- Calculate final intersection point and project onto movement axis
+    local planeIntersection = rayOrigin + rayDirection * intersectionDistance
+    local vectorToIntersection = planeIntersection - partPosition
+    local axisProjection = worldAxisVector:Dot(vectorToIntersection)
+    local projectedPosition = partPosition + worldAxisVector * axisProjection
+    
+    return projectedPosition
+end
+
+local function GetOrCreateHandlesFolder()
+	local PlayerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+	local HandlesFolder = PlayerGui:FindFirstChild("Handles")
+	if not HandlesFolder then
+		HandlesFolder = Instance.new("Folder")
+		HandlesFolder.Name = "Handles"
+		HandlesFolder.Parent = PlayerGui
+	end
+	return HandlesFolder
+end
+
+local function CreateMoveResizeHandle(Normal, Resize)
+	if not SelectedPart then return nil end
+
+	local NormalToAxis = NORMALS_TO_AXIS[Normal]
+	local HANDLE_COLOR = HANDLE_COLORS[NormalToAxis]
+	local INNER_HANDLE_COLOR = INNER_HANDLE_COLORS[NormalToAxis]
+	local HandlesFolder = GetOrCreateHandlesFolder()
+	local NormalVector = Vector3.fromNormalId(Normal)
+
+	local HandleAdornment = nil
+	if Resize then
+		HandleAdornment = Instance.new("SphereHandleAdornment")
+		HandleAdornment.Radius = HANDLE_RADIUS / 2
+	else
+		HandleAdornment = Instance.new("BoxHandleAdornment")
+		HandleAdornment.Size = Vector3.new(HANDLE_RADIUS, HANDLE_RADIUS, HANDLE_RADIUS)
+	end
+
+	HandleAdornment.Adornee = SelectedPart
+	HandleAdornment.Color3 = HANDLE_COLOR
+	HandleAdornment.SizeRelativeOffset = NormalVector
+	HandleAdornment.CFrame = CFrame.new(NormalVector * HANDLE_OFFSET)
+	HandleAdornment.ZIndex = 1
+	HandleAdornment.AlwaysOnTop = true
+	HandleAdornment.Transparency = HANDLE_TRANSPARENCY
+	HandleAdornment.Parent = HandlesFolder
+
+	local InnerHandlePoint = nil
+	if Resize then
+		InnerHandlePoint = Instance.new("SphereHandleAdornment")
+		InnerHandlePoint.Radius = INNER_HANDLE_RADIUS / 2
+	else
+		InnerHandlePoint = Instance.new("BoxHandleAdornment")
+		InnerHandlePoint.Size = Vector3.new(INNER_HANDLE_RADIUS, INNER_HANDLE_RADIUS, INNER_HANDLE_RADIUS)
+	end
+
+	InnerHandlePoint.Adornee = SelectedPart
+	InnerHandlePoint.Color3 = INNER_HANDLE_COLOR
+	InnerHandlePoint.SizeRelativeOffset = NormalVector
+	InnerHandlePoint.CFrame = CFrame.new(NormalVector * HANDLE_OFFSET)
+	InnerHandlePoint.ZIndex = 2
+	InnerHandlePoint.AlwaysOnTop = true
+	InnerHandlePoint.Transparency = 0
+	InnerHandlePoint.Parent = HandlesFolder
+
+	HandleAdornment.MouseEnter:Connect(function()
+		IsHoveringHandle = true
+	end)
+
+	HandleAdornment.MouseLeave:Connect(function()
+		IsHoveringHandle = false
+	end)
+
+	return HandleAdornment
+end
+
+local function SetupHandleMoving(handle, Normal)
+    local RunService = game:GetService("RunService")
+    local UserInputService = game:GetService("UserInputService")
+    local camera = workspace.CurrentCamera
+    
+    local moving = false
+    local startMousePos = nil
+    local axisVector = Vector3.fromNormalId(Normal)
+    local startCFrame = nil
+    local totalOffset = 0
+    
+    local function GetAxisMovement(startPos, currentPos, worldAxis)
+        -- Convert world axis to screen axis
+        local axisStart = camera:WorldToViewportPoint(startCFrame.Position)
+        local axisEnd = camera:WorldToViewportPoint(startCFrame.Position + worldAxis)
+        local screenAxis = Vector2.new(axisEnd.X - axisStart.X, axisEnd.Y - axisStart.Y).Unit
+        
+        -- Get screen movement delta
+        local screenDelta = Vector2.new(currentPos.X - startPos.X, currentPos.Y - startPos.Y)
+        
+        -- Project screen movement onto axis
+        local movement = screenDelta:Dot(screenAxis)
+        
+        -- Scale movement based on screen-to-world ratio
+        local worldDistance = (startCFrame.Position - camera.CFrame.Position).Magnitude
+        local screenScale = worldDistance / camera.ViewportSize.X
+        
+        return movement * screenScale
+    end
+    
+    local function StartMoving()
+        if not CanActivateHandle() then return end
+        
+        -- Set handle color
+        local NormalToAxis = NORMALS_TO_AXIS[Normal]
+        local HANDLE_ACTIVE_COLOR = HANDLE_ACTIVE_COLORS[NormalToAxis]
+        handle.Color3 = HANDLE_ACTIVE_COLOR
+        
+        -- Initialize movement
+        moving = true
+        startCFrame = SelectedPart.CFrame
+        startMousePos = UserInputService:GetMouseLocation()
+        totalOffset = 0
+        
+        table.insert(ActiveHandles, handle)
+        
+        local worldAxis = startCFrame:VectorToWorldSpace(axisVector)
+    end
+    
+    local function UpdatePosition()
+        if not (moving and SelectedPart and startMousePos) then return end
+        
+        local currentMousePos = UserInputService:GetMouseLocation()
+        local worldAxis = startCFrame:VectorToWorldSpace(axisVector)
+        
+        -- Calculate movement along axis
+        local delta = GetAxisMovement(startMousePos, currentMousePos, worldAxis)
+        local newOffset = ApplySnap(totalOffset + delta) - totalOffset
+        
+        if math.abs(newOffset) > 0.001 then
+            -- Apply movement in world space
+            SelectedPart.CFrame = startCFrame * CFrame.new(
+                axisVector.X * newOffset,
+                axisVector.Y * newOffset,
+                axisVector.Z * newOffset
+            )
+            totalOffset = totalOffset + newOffset
+        end
+    end
+    
+    local function StopMoving()
+        if not moving then return end
+        
+        moving = false
+        startMousePos = nil
+        startCFrame = nil
+        totalOffset = 0
+        
+        -- Reset handle color
+        local NormalToAxis = NORMALS_TO_AXIS[Normal]
+        local HANDLE_COLOR = HANDLE_COLORS[NormalToAxis]
+        handle.Color3 = HANDLE_COLOR
+        
+        -- Remove from active handles
+        for i, activeHandle in ipairs(ActiveHandles) do
+            if activeHandle == handle then
+                table.remove(ActiveHandles, i)
+                break
+            end
+        end
+    end
+    
+    -- Connect events
+    handle.MouseButton1Down:Connect(StartMoving)
+    
+    UserInputService.InputEnded:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseButton1 or 
+            input.UserInputType == Enum.UserInputType.Touch) and moving then
+            StopMoving()
+        end
+    end)
+    
+    RunService.Heartbeat:Connect(UpdatePosition)
+end
+
+
+local function CreateRotationRing(Axis)
+	if not SelectedPart then return nil end
+
+	local HandlesFolder = GetOrCreateHandlesFolder()
+	local RING_RADIUS = (SelectedPart.Size.Magnitude / 2) + (HANDLE_OFFSET / 2)
+
+	local RingAdornment = Instance.new("CylinderHandleAdornment")
+	RingAdornment.Adornee = SelectedPart
+	RingAdornment.Color3 = HANDLE_COLORS[Axis]
+	RingAdornment.Height = RING_THICKNESS
+	RingAdornment.Radius = RING_RADIUS
+	RingAdornment.InnerRadius = RING_RADIUS - RING_THICKNESS
+	RingAdornment.ZIndex = 1
+	RingAdornment.AlwaysOnTop = false
+	RingAdornment.Transparency = HANDLE_TRANSPARENCY
+	RingAdornment.Parent = HandlesFolder
+
+	if Axis == Enum.Axis.Z then
+		RingAdornment.CFrame = CFrame.fromAxisAngle(Vector3.new(0, 0, 1), math.rad(90))
+	elseif Axis == Enum.Axis.Y then
+		RingAdornment.CFrame = CFrame.fromAxisAngle(Vector3.new(1, 0, 0), math.rad(90))
+	elseif Axis == Enum.Axis.X then
+		RingAdornment.CFrame = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), math.rad(90))
+	end
+
+	return RingAdornment
+end
+
+local function ScreenPointToPlane(camera, screenPoint, planePoint, planeNormal)
+	local rayOrigin = camera.CFrame.Position
+	local rayDirection = camera:ScreenPointToRay(screenPoint.X, screenPoint.Y).Unit.Direction
+
+	local dot = planeNormal:Dot(rayDirection)
+
+	if math.abs(dot) > 1e-6 then
+		local t = (planeNormal:Dot(planePoint - rayOrigin)) / dot
+		return rayOrigin + rayDirection * t
+	end
+
+	return nil
+end
+
+local function CreateRotationHandle(Axis, Direction)
+	if not SelectedPart then return nil end
+
+	local HANDLE_COLOR = HANDLE_COLORS[Axis]
+	local INNER_HANDLE_COLOR = INNER_HANDLE_COLORS[Axis]
+	local HandlesFolder = GetOrCreateHandlesFolder()
+
+	local NormalVector = CFrame.identity
+
+	if Axis == Enum.Axis.Z then
+		NormalVector = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), math.rad(90))
+	elseif Axis == Enum.Axis.X then
+		NormalVector = CFrame.fromAxisAngle(Vector3.new(1, 0, 0), math.rad(-90))
+	elseif Axis == Enum.Axis.Y then
+		NormalVector = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), math.rad(0))
+	end
+
+	local RING_RADIUS = (SelectedPart.Size.Magnitude / 2) + (HANDLE_OFFSET / 2)
+
+	local HandleAdornment = Instance.new("SphereHandleAdornment")
+	HandleAdornment.Adornee = SelectedPart
+	HandleAdornment.Color3 = HANDLE_COLOR
+	HandleAdornment.CFrame = NormalVector * CFrame.new(0, 0, -RING_RADIUS * Direction)
+	HandleAdornment.ZIndex = 2
+	HandleAdornment.AlwaysOnTop = true
+	HandleAdornment.Radius = HANDLE_RADIUS / 2
+	HandleAdornment.Transparency = 0
+	HandleAdornment.Parent = HandlesFolder
+
+	local InnerHandlePoint = Instance.new("SphereHandleAdornment")
+	InnerHandlePoint.Adornee = SelectedPart
+	InnerHandlePoint.Color3 = INNER_HANDLE_COLOR
+	InnerHandlePoint.CFrame = NormalVector * CFrame.new(0, 0, -RING_RADIUS * Direction)
+	InnerHandlePoint.ZIndex = 3
+	InnerHandlePoint.AlwaysOnTop = true
+	InnerHandlePoint.Radius = INNER_HANDLE_RADIUS / 2
+	InnerHandlePoint.Transparency = 0
+	InnerHandlePoint.Parent = HandlesFolder
+
+	HandleAdornment.MouseEnter:Connect(function()
+		HandleAdornment.Color3 = HANDLE_ACTIVE_COLORS[Axis]
+		IsHoveringHandle = true
+	end)
+
+	HandleAdornment.MouseLeave:Connect(function()
+		HandleAdornment.Color3 = HANDLE_COLOR
+		IsHoveringHandle = false
+	end)
+
+	return HandleAdornment
+end
+
+local function SetupRotationHandleDragging(handle, Axis, Direction)
+	local dragging = false
+	local lastMousePosition = nil
+	local startCFrame = nil
+	local accumulatedRotation = 0
+	local totalRotation = 0
+	local camera = workspace.CurrentCamera
+
+	handle.MouseButton1Down:Connect(function()
+		if not CanActivateHandle() then return end
+		dragging = true
+		lastMousePosition = UserInputService:GetMouseLocation()
+		startCFrame = SelectedPart.CFrame
+		accumulatedRotation = 0
+		totalRotation = 0
+		table.insert(ActiveHandles, handle)
+	end)
+
+	local function UpdateRotation()
+		if not dragging or not SelectedPart then return end
+
+		local currentMousePosition = UserInputService:GetMouseLocation()
+		if lastMousePosition and startCFrame then
+			local axisVector = Vector3.fromAxis(Axis)
+			local worldAxisVector = startCFrame:VectorToWorldSpace(axisVector)
+
+			-- Project mouse movement onto a plane perpendicular to the rotation axis
+			local planeNormal = worldAxisVector
+			local planePoint = startCFrame.Position
+			local oldPoint = ScreenPointToPlane(camera, lastMousePosition, planePoint, planeNormal)
+			local newPoint = ScreenPointToPlane(camera, currentMousePosition, planePoint, planeNormal)
+
+			if oldPoint and newPoint then
+				-- Calculate the angle between old and new points
+				local centerToOld = (oldPoint - planePoint).Unit
+				local centerToNew = (newPoint - planePoint).Unit
+				local deltaAngle = math.atan2(centerToNew:Cross(centerToOld):Dot(planeNormal), centerToNew:Dot(centerToOld))
+
+				-- Apply direction and sensitivity
+				deltaAngle = deltaAngle * Direction * 1 -- Adjust sensitivity if needed
+
+				accumulatedRotation = accumulatedRotation + deltaAngle
+
+				local snappedRotation = ApplySnap(totalRotation + accumulatedRotation, true) - totalRotation
+
+				if snappedRotation ~= 0 then
+					local newCFrame = startCFrame * CFrame.fromAxisAngle(axisVector, totalRotation + snappedRotation)
+					SelectedPart.CFrame = newCFrame
+					totalRotation = totalRotation + snappedRotation
+					accumulatedRotation = accumulatedRotation - snappedRotation
+				end
+			end
+
+			lastMousePosition = currentMousePosition
+		end
+	end
+
+	RunService.Heartbeat:Connect(UpdateRotation)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+			dragging = false
+			for i, activeHandle in ipairs(ActiveHandles) do
+				if activeHandle == handle then
+					table.remove(ActiveHandles, i)
+					break
+				end
+			end
+		end
+	end)
+end
+
+local function SetupHandleResizing(handle, Normal)
+	local resizing = false
+	local lastPosition = nil
+	local axisVector = Vector3.fromNormalId(Normal)
+	local startSize = nil
+	local startCFrame = nil
+	local accumulatedDelta = 0
+	local totalSizeDelta = 0
+
+	handle.MouseButton1Down:Connect(function()
+		if not CanActivateHandle() then return end
+		local NormalToAxis = NORMALS_TO_AXIS[Normal]
+		local HANDLE_ACTIVE_COLOR = HANDLE_ACTIVE_COLORS[NormalToAxis]
+		handle.Color3 = HANDLE_ACTIVE_COLOR
+		resizing = true
+		lastPosition = GetMousePositionOnAxis(axisVector, SelectedPart.CFrame)
+		startSize = SelectedPart.Size
+		startCFrame = SelectedPart.CFrame
+		accumulatedDelta = 0
+		totalSizeDelta = 0
+		table.insert(ActiveHandles, handle)
+	end)
+
+	local function UpdateSize()
+		if not resizing or not SelectedPart then return end
+
+		local currentPosition = GetMousePositionOnAxis(axisVector, SelectedPart.CFrame)
+		if lastPosition and startSize and startCFrame then
+			local worldDelta = (currentPosition - lastPosition):Dot(startCFrame.RightVector * axisVector.X + startCFrame.UpVector * axisVector.Y + startCFrame.LookVector * axisVector.Z)
+
+			-- Invert the delta for Left, Bottom, and Front normals
+			if INVERSE_NORMALS[Normal] then
+				worldDelta = -worldDelta
+			end
+
+			accumulatedDelta = accumulatedDelta + worldDelta
+
+			local sizeDelta = ApplySnap(totalSizeDelta + accumulatedDelta) - totalSizeDelta
+
+
+			if sizeDelta ~= 0 then
+				local newSize = SelectedPart.Size + (axisVector * sizeDelta)
+				newSize = Vector3.new(
+					math.clamp(newSize.X, GRID_SIZE, MAX_SIZE_PER_AXIS),
+					math.clamp(newSize.Y, GRID_SIZE, MAX_SIZE_PER_AXIS),
+					math.clamp(newSize.Z, GRID_SIZE, MAX_SIZE_PER_AXIS)
+				)
+
+				SelectedPart.Size = newSize
+
+				-- Adjust position to keep the opposite face stationary
+				local positionOffset = startCFrame:VectorToWorldSpace((newSize - startSize) * 0.5 * axisVector)
+				SelectedPart.Position = startCFrame.Position + positionOffset
+
+				totalSizeDelta = totalSizeDelta + sizeDelta
+				accumulatedDelta = accumulatedDelta - sizeDelta
+			end
+
+			lastPosition = currentPosition
+		end
+	end
+
+	RunService.Heartbeat:Connect(UpdateSize)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and resizing then
+			resizing = false
+			local NormalToAxis = NORMALS_TO_AXIS[Normal]
+			local HANDLE_COLOR = HANDLE_COLORS[NormalToAxis]
+			handle.Color3 = HANDLE_COLOR
+			for i, activeHandle in ipairs(ActiveHandles) do
+				if activeHandle == handle then
+					table.remove(ActiveHandles, i)
+					break
+				end
+			end
+		end
+	end)
+end
+
+local function CreateRotationHandlesAndRings()
+	if not SelectedPart then return end
+
+	for _, Axis in ipairs(Enum.Axis:GetEnumItems()) do
+		local ring = CreateRotationRing(Axis)
+		table.insert(RotationHandles, ring)
+	end
+
+	local AxisPairs = {
+		{Enum.Axis.X, 1, -1},
+		{Enum.Axis.Y, 1, -1},
+		{Enum.Axis.Z, 1, -1}
+	}
+
+	for _, AxisPair in ipairs(AxisPairs) do
+		local handle1 = CreateRotationHandle(AxisPair[1], AxisPair[2])  -- Create handle on positive side
+		local handle2 = CreateRotationHandle(AxisPair[1], AxisPair[3])  -- Create handle on negative side
+		if handle1 and handle2 then
+			SetupRotationHandleDragging(handle1, AxisPair[1], AxisPair[2])
+			SetupRotationHandleDragging(handle2, AxisPair[1], AxisPair[3])
+			table.insert(RotationHandles, handle1)
+			table.insert(RotationHandles, handle2)
+		end
+	end
+end
+
+
+local function SetupHandleManipulation(handle, Normal)
+	if CurrentMode == "Move" then
+		SetupHandleMoving(handle, Normal)
+	elseif CurrentMode == "Resize" then
+		SetupHandleResizing(handle, Normal)
+	end
+end
+
+local function CreateHandles(Resize)
+	if not SelectedPart then return end
+
+	for _, Normal in ipairs(Enum.NormalId:GetEnumItems()) do
+		local handle = CreateMoveResizeHandle(Normal, Resize)
+		if handle then
+			SetupHandleManipulation(handle, Normal)
+			table.insert(Handles, handle)
+		end
+	end
+end
+
+local function ClearHandles()
+	local HandlesFolder = GetOrCreateHandlesFolder()
+	HandlesFolder:ClearAllChildren()
+	Handles = {}
+	RotationHandles = {}
+end
+
+local function UpdateHandles()
+	ClearHandles()
+	if SelectedPart then
+		if CurrentMode == "Move" or CurrentMode == "Resize" then
+			if CurrentMode == "Resize" then
+				CreateHandles(true)
+			else
+				CreateHandles(false)
+			end
+		elseif CurrentMode == "Rotate" then
+			CreateRotationHandlesAndRings()
+		end
+	end
+end
+
+
+
+local function SetMode(mode)
+	if not BuildingEnabled then return end  -- Don't change mode if building is disabled
+
+	CurrentMode = mode
+	print("Set mode to:", mode)
+	UpdateHandles()
+end
+
+local function DeselectPart()
+	if IsHoveringHandle then return end  -- Prevent deselection if hovering over a handle
+	SelectedPart = nil
+	ClearHandles()
+end
+
+local function ToggleBuildMode()
+	BuildingEnabled = not BuildingEnabled
+	if not BuildingEnabled then
+		-- Clean up when disabling build mode
+		DeselectPart()
+		ClearHandles()
+		print("Building mode disabled")
+	else
+		print("Building mode enabled")
+	end
+end
+
+local function SelectPart(part)
+	if not BuildingEnabled then return end  -- Don't select if building is disabled
+
+	if SelectedPart then
+		DeselectPart()  -- Clean up the previously selected part
+	end
+	if part:IsA("BasePart") then
+		SelectedPart = part
+	end
+	UpdateHandles()
+end
+
+-- Set up part selection
+local function SetupPartSelection()
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if not gameProcessed then
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				if not BuildingEnabled then return end  -- Don't process clicks if building is disabled
+				if IsHoveringHandle then return end  -- Prevent deselection if hovering over a handle
+
+				local mouse = Players.LocalPlayer:GetMouse()
+				local target = mouse.Target
+				if target and target:IsA("BasePart") then
+					SelectPart(target)
+				else
+					DeselectPart()
+				end
+			elseif input.KeyCode == Enum.KeyCode.G and SelectedPart and BuildingEnabled then
+				-- Delete functionality (only works if building is enabled)
+				SelectedPart:Destroy()
+				DeselectPart()
+			elseif input.KeyCode == Enum.KeyCode.B then
+				-- Toggle build mode
+				ToggleBuildMode()
+			end
+		end
+	end)
+end
+
+
+-- Set up mode switching using keyboard input
+local function SetupModeSwitching()
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if not gameProcessed and BuildingEnabled then  -- Only process if building is enabled
+			if input.KeyCode == Enum.KeyCode.R then
+				SetMode("Move")
+			elseif input.KeyCode == Enum.KeyCode.T then
+				SetMode("Resize")
+			elseif input.KeyCode == Enum.KeyCode.Z or input.KeyCode == Enum.KeyCode.Y then
+				SetMode("Rotate")
+			end
+		end
+	end)
+end
+
+
+-- Main execution
+SetupPartSelection()
+SetupModeSwitching()
+
+-- Set the initial mode to DefaultMode
+SetMode(DefaultMode)
+
+print("Part manipulation tool initialized. Click to select a part. Press R for Move, T for Resize, Z or Y for Rotate, G to delete. Current mode: " .. DefaultMode)
+
+print("Press B to disable or enable Part manipulation tool !")
